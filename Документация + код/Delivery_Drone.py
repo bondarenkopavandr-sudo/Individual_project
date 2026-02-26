@@ -1,24 +1,24 @@
-from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative
+from dronekit import connect, VehicleMode, LocationGlobalRelative
 from pymavlink import mavutil
 import time
-import math
-import socket
 import argparse
 import geopy.distance
 
-import face_recognition
+import cv2
 import picamera
 import numpy as np
+from pyzbar.pyzbar import decode
 
 
 def connectMyCopter():
-    parser = argparse.ArgumentParser(description='commands')
-    parser.add_argument('Подключение')
+    parser = argparse.ArgumentParser(description='Управление дроном-доставщиком')
+    parser.add_argument('--connect', required=True,
+                        help='Строка подключения')
     args = parser.parse_args()
 
     connection_string = args.connect
     baud_rate = 57600
-    print("\nПодключение к дрону: %s" % connection_string)
+    print(f"\nПодключение к дрону: {connection_string}")
     vehicle = connect(connection_string, baud=baud_rate, wait_ready=True)
     return vehicle
 
@@ -26,7 +26,7 @@ def connectMyCopter():
 def arm_and_takeoff(aTargetAltitude):
     print("Базовые проверки перед запуском")
     while not vehicle.is_armable:
-        print(" Ожидание инициализации")
+        print(" Ожидание инициализации...")
         time.sleep(1)
 
     print("Включение двигателей")
@@ -34,14 +34,16 @@ def arm_and_takeoff(aTargetAltitude):
     vehicle.armed = True
 
     while not vehicle.armed:
-        print(" Ожидание активации")
+        print(" Ожидание активации...")
         time.sleep(1)
 
     print("Взлёт!")
     vehicle.simple_takeoff(aTargetAltitude)
+
     while True:
-        print(" Altitude: ", vehicle.location.global_relative_frame.alt)
-        if vehicle.location.global_relative_frame.alt >= aTargetAltitude * 0.95:
+        alt = vehicle.location.global_relative_frame.alt
+        print(f" Высота: {alt:.2f} м")
+        if alt >= aTargetAltitude * 0.95:
             print("Достигнута целевая высота")
             break
         time.sleep(1)
@@ -60,81 +62,93 @@ def drop_parcel():
     print("Посылка сброшена")
 
 
-def get_dstance(cord1, cord2):
-    return (geopy.distance.geodesic(cord1, cord2).km) * 1000
-
-camera = picamera.PiCamera()
-camera.resolution = (640, 480)
-output = np.empty((480, 640, 3), dtype=np.uint8)
-print("Загрузка изображений лиц")
-dima_image = face_recognition.load_image_file("faces/dima1.jpg")
-dima_face_encoding = face_recognition.face_encodings(dima_image)[0]
-
-face_locations = []
-face_encodings = []
-
-vehicle = connectMyCopter()
+def get_distance(cord1, cord2):
+    return geopy.distance.geodesic(cord1, cord2).m
 
 
-def goto_location(to_lat, to_long):
-    print(" Местоположение: %s" % vehicle.location.global_relative_frame)
-    curr_lat = vehicle.location.global_relative_frame.lat
-    curr_lon = vehicle.location.global_relative_frame.lon
+def goto_location(to_lat, to_lon):
+    print(f"Текущее местоположение: {vehicle.location.global_relative_frame}")
     curr_alt = vehicle.location.global_relative_frame.alt
 
-    to_lat = to_lat
-    to_lon = to_long
-    to_alt = curr_alt
+    target_point = LocationGlobalRelative(to_lat, to_lon, curr_alt)
+    vehicle.simple_goto(target_point, groundspeed=1)
 
-    to_pont = LocationGlobalRelative(to_lat, to_lon, to_alt)
-    vehicle.simple_goto(to_pont, groundspeed=1)
-
-    to_cord = (to_lat, to_lon)
+    target_cord = (to_lat, to_lon)
     while True:
         curr_lat = vehicle.location.global_relative_frame.lat
         curr_lon = vehicle.location.global_relative_frame.lon
         curr_cord = (curr_lat, curr_lon)
-        print("Текущее местоположение: {}".format(curr_cord))
-        distance = get_dstance(curr_cord, to_cord)
-        print("Оставшееся расстояние {}".format(distance))
+        print(f"Текущие координаты: {curr_cord}")
+        distance = get_distance(curr_cord, target_cord)
+        print(f"Оставшееся расстояние: {distance:.2f} м")
         if distance <= 2:
-            print("Достигнуто место в пределах 2 метров от целевого")
+            print("Достигнута точка в пределах 2 м")
             break
         time.sleep(1)
 
 
-def identify_person():
-    found = False
-    while True:
-        print("\nЗахват изображения")
-        camera.capture(output, format="rgb")
+def find_qr_and_drop(target_height=1.0, expected_data=None):
+    global camera, output
+    print("Поиск QR-кода...")
 
-        face_locations = face_recognition.face_locations(output)
-        print("Найдено {} лиц на изображении.".format(len(face_locations)))
-        face_encodings = face_recognition.face_encodings(output, face_locations)
+    qr_found = False
+    while not qr_found:
+        camera.capture(output, format="bgr")
+        barcodes = decode(output)
 
-        for face_encoding in face_encodings:
-            match = face_recognition.compare_faces([dima_face_encoding], face_encoding)
-            name = "<Неизвестный>"
+        for barcode in barcodes:
+            qr_data = barcode.data.decode("utf-8")
+            print(f"Найден QR: {qr_data}")
+            if expected_data is None or qr_data == expected_data:
+                qr_found = True
+                break
 
-            if match[0]:
-                name = "Дима"
-                found = True
-                print("Найдено {} ".format(name))
-
-            print("Я виже человека по имени {}!".format(name))
-
-        if found:
+        if qr_found:
             break
+        time.sleep(0.5)
+    print("QR найден! Снижаюсь...")
+    current_alt = vehicle.location.global_relative_frame.alt
+    if current_alt <= target_height:
+        print("Уже на нужной высоте или ниже")
+    else:
+        target_point = LocationGlobalRelative(
+            vehicle.location.global_relative_frame.lat,
+            vehicle.location.global_relative_frame.lon,
+            target_height
+        )
+        vehicle.simple_goto(target_point, groundspeed=0.5)
+
+        while True:
+            alt = vehicle.location.global_relative_frame.alt
+            print(f"Текущая высота: {alt:.2f} м")
+            if alt <= target_height * 1.05:
+                print("Достигнута целевая высота")
+                break
+            time.sleep(1)
+
+    drop_parcel()
 
 
 def my_mission():
     arm_and_takeoff(3)
     goto_location(25.806476, 86.778428)
-    identify_person()
-    drop_parcel()
+    find_qr_and_drop(target_height=1.0, expected_data="DELIVERY")
     time.sleep(2)
-    print("Возвращаемся к запуску")
+    print("Возврат на базу")
     vehicle.mode = VehicleMode("RTL")
 
-my_mission()
+if __name__ == "__main__":
+    camera = picamera.PiCamera()
+    camera.resolution = (640, 480)
+    output = np.empty((480, 640, 3), dtype=np.uint8)
+
+    vehicle = connectMyCopter()
+
+    try:
+        my_mission()
+    except KeyboardInterrupt:
+        print("\nПрерывание пользователя, возврат домой...")
+        vehicle.mode = VehicleMode("RTL")
+    finally:
+        camera.close()
+        vehicle.close()
